@@ -1,0 +1,626 @@
+import os
+import json
+import logging
+from pathlib import Path
+
+import requests
+import pandas as pd
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from sqlalchemy import create_engine, text
+
+
+# =========================================================
+# LOGGING SETUP
+# =========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+
+SUPABASE_DB_URL = os.getenv(
+    "SUPABASE_DB_URL",
+    "postgresql+psycopg2://USERNAME:PASSWORD@HOST:5432/postgres"
+)
+
+RAW_DATA_DIR = Path("raw_api_responses")
+RAW_DATA_DIR.mkdir(exist_ok=True)
+
+engine = create_engine(SUPABASE_DB_URL)
+
+
+# =========================================================
+# USER COORDINATES
+# =========================================================
+
+def get_user_coordinates():
+    latitude = float(input("Enter your latitude: "))
+    longitude = float(input("Enter your longitude: "))
+    return latitude, longitude
+
+
+# =========================================================
+# RETRY SESSION
+# =========================================================
+
+def create_retry_session():
+    session = requests.Session()
+
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
+
+
+# =========================================================
+# SAVE RAW API RESPONSE
+# =========================================================
+
+def save_raw_response(data, filename):
+    file_path = RAW_DATA_DIR / filename
+
+    with open(file_path, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
+
+    logger.info(f"Saved raw API response to {file_path}")
+
+
+# =========================================================
+# VALIDATION FUNCTIONS
+# =========================================================
+
+def validate_api_response(data, expected_key, api_name):
+    if not data:
+        raise ValueError(f"{api_name} validation failed: API response is empty.")
+
+    if expected_key not in data:
+        raise ValueError(
+            f"{api_name} validation failed: Missing expected key '{expected_key}'."
+        )
+
+    if not data[expected_key]:
+        raise ValueError(
+            f"{api_name} validation failed: '{expected_key}' contains no records."
+        )
+
+    logger.info(f"{api_name} validation passed.")
+
+
+def validate_dataframe(df, df_name):
+    if df.empty:
+        raise ValueError(f"{df_name} validation failed: DataFrame is empty.")
+
+    if "time" not in df.columns:
+        raise ValueError(f"{df_name} validation failed: Missing required 'time' column.")
+
+    duplicate_count = df.duplicated(subset=["time"]).sum()
+
+    if duplicate_count > 0:
+        logger.warning(f"{df_name}: {duplicate_count} duplicate timestamp rows found.")
+    else:
+        logger.info(f"{df_name}: No duplicate timestamps found.")
+
+    null_counts = df.isnull().sum()
+    null_columns = null_counts[null_counts > 0]
+
+    if not null_columns.empty:
+        logger.warning(f"{df_name}: Null values found:\n{null_columns}")
+    else:
+        logger.info(f"{df_name}: No null values found.")
+
+    logger.info(f"{df_name}: {len(df)} rows available.")
+
+
+def validate_schema(df):
+    expected_columns = {
+        "time",
+        "temperature_2m_f",
+        "humidity_percent",
+        "apparent_temperature_f",
+        "precipitation_probability_percent",
+        "wind_speed_mph",
+        "uv_index",
+        "aqi",
+        "pm25",
+        "pm10",
+        "temperature_score",
+        "humidity_score",
+        "precipitation_score",
+        "wind_score",
+        "aqi_score",
+        "uv_score",
+        "run_score",
+        "recommendation"
+    }
+
+    missing_columns = expected_columns - set(df.columns)
+
+    if missing_columns:
+        raise ValueError(f"Schema validation failed. Missing columns: {missing_columns}")
+
+    logger.info("Schema validation passed.")
+
+
+def validate_ranges(df):
+    range_checks = {
+        "temperature_2m_f": (-50, 130),
+        "humidity_percent": (0, 100),
+        "precipitation_probability_percent": (0, 100),
+        "wind_speed_mph": (0, 200),
+        "uv_index": (0, 15),
+        "aqi": (1, 5),
+        "pm25": (0, 1000),
+        "pm10": (0, 1000),
+        "run_score": (0, 100)
+    }
+
+    for column, (minimum, maximum) in range_checks.items():
+        invalid_rows = df[
+            (df[column] < minimum) |
+            (df[column] > maximum)
+        ]
+
+        if not invalid_rows.empty:
+            raise ValueError(
+                f"Range validation failed for {column}: "
+                f"{len(invalid_rows)} invalid rows found."
+            )
+
+    logger.info("Range validation passed.")
+
+
+def validate_postgres_load(expected_rows):
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            SELECT COUNT(*) FROM weather_hourly;
+        """)).fetchone()
+
+        actual_rows = result[0]
+
+    if actual_rows < expected_rows:
+        raise ValueError(
+            f"Row count validation failed: Expected at least {expected_rows}, "
+            f"but database contains {actual_rows}."
+        )
+
+    logger.info(f"Row count validation passed. Database contains {actual_rows} rows.")
+
+
+# =========================================================
+# EXTRACT: OPENWEATHER ONE CALL API
+# =========================================================
+
+def extract_weather_data(latitude, longitude):
+    logger.info("Extracting weather forecast data from OpenWeather One Call API.")
+
+    url = "https://api.openweathermap.org/data/3.0/onecall"
+
+    params = {
+        "lat": latitude,
+        "lon": longitude,
+        "appid": OPENWEATHER_API_KEY,
+        "units": "imperial",
+        "exclude": "current,minutely,daily,alerts"
+    }
+
+    session = create_retry_session()
+    response = session.get(url, params=params, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+
+    validate_api_response(data, "hourly", "Weather API")
+    save_raw_response(data, "weather_forecast_raw.json")
+
+    weather_rows = []
+
+    for hour in data["hourly"]:
+        weather_rows.append({
+            "time": pd.to_datetime(hour["dt"], unit="s"),
+            "temperature_2m_f": hour.get("temp"),
+            "humidity_percent": hour.get("humidity"),
+            "apparent_temperature_f": hour.get("feels_like"),
+            "precipitation_probability_percent": hour.get("pop", 0) * 100,
+            "wind_speed_mph": hour.get("wind_speed"),
+            "uv_index": hour.get("uvi", 0)
+        })
+
+    return pd.DataFrame(weather_rows)
+
+
+# =========================================================
+# EXTRACT: OPENWEATHER AIR POLLUTION API
+# =========================================================
+
+def extract_air_quality_data(latitude, longitude):
+    logger.info("Extracting air quality data from OpenWeather Air Pollution API.")
+
+    url = "https://api.openweathermap.org/data/2.5/air_pollution/forecast"
+
+    params = {
+        "lat": latitude,
+        "lon": longitude,
+        "appid": OPENWEATHER_API_KEY
+    }
+
+    session = create_retry_session()
+    response = session.get(url, params=params, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+
+    validate_api_response(data, "list", "Air Quality API")
+    save_raw_response(data, "air_quality_raw.json")
+
+    air_rows = []
+
+    for item in data["list"]:
+        air_rows.append({
+            "time": pd.to_datetime(item["dt"], unit="s"),
+            "aqi": item["main"].get("aqi"),
+            "pm25": item["components"].get("pm2_5"),
+            "pm10": item["components"].get("pm10")
+        })
+
+    return pd.DataFrame(air_rows)
+
+
+# =========================================================
+# CREATE POSTGRESQL TABLE
+# =========================================================
+
+def create_table():
+    logger.info("Creating PostgreSQL table if it does not exist.")
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS weather_hourly (
+            time TIMESTAMP PRIMARY KEY,
+
+            temperature_2m_f DOUBLE PRECISION,
+            humidity_percent DOUBLE PRECISION,
+            apparent_temperature_f DOUBLE PRECISION,
+            precipitation_probability_percent DOUBLE PRECISION,
+            wind_speed_mph DOUBLE PRECISION,
+            uv_index DOUBLE PRECISION,
+
+            aqi INTEGER,
+            pm25 DOUBLE PRECISION,
+            pm10 DOUBLE PRECISION,
+
+            temperature_score INTEGER,
+            humidity_score INTEGER,
+            precipitation_score INTEGER,
+            wind_score INTEGER,
+            aqi_score INTEGER,
+            uv_score INTEGER,
+
+            run_score DOUBLE PRECISION,
+            recommendation TEXT
+        );
+        """))
+
+
+# =========================================================
+# SCORING FUNCTIONS
+# =========================================================
+
+def temperature_score(temp):
+    if temp < 32:
+        return 30
+    elif 40 <= temp <= 49:
+        return 85
+    elif 50 <= temp <= 65:
+        return 100
+    elif 76 <= temp <= 85:
+        return 55
+    elif temp > 85:
+        return 25
+    else:
+        return 70
+
+
+def humidity_score(humidity):
+    if humidity < 55:
+        return 100
+    elif 55 <= humidity <= 60:
+        return 85
+    elif 61 <= humidity <= 65:
+        return 70
+    elif humidity > 70:
+        return 20
+    else:
+        return 50
+
+
+def precipitation_score(precipitation_probability):
+    if precipitation_probability <= 10:
+        return 100
+    elif precipitation_probability <= 30:
+        return 85
+    elif precipitation_probability <= 50:
+        return 60
+    elif precipitation_probability <= 70:
+        return 35
+    else:
+        return 10
+
+
+def wind_score(wind):
+    if wind < 10:
+        return 100
+    elif wind <= 15:
+        return 80
+    elif wind <= 20:
+        return 60
+    elif wind <= 30:
+        return 35
+    else:
+        return 10
+
+
+def aqi_score(aqi):
+    if aqi <= 1:
+        return 100
+    elif aqi == 2:
+        return 80
+    elif aqi == 3:
+        return 45
+    else:
+        return 10
+
+
+def uv_score(uv):
+    if uv <= 2:
+        return 100
+    elif uv <= 5:
+        return 85
+    elif uv <= 7:
+        return 65
+    elif uv <= 10:
+        return 40
+    else:
+        return 20
+
+
+# =========================================================
+# TRANSFORM DATA
+# =========================================================
+
+def transform_data(weather_df, air_df):
+    logger.info("Transforming weather and air quality data.")
+
+    df = pd.merge(weather_df, air_df, on="time", how="left")
+
+    df = df.drop_duplicates(subset=["time"])
+
+    df = df.fillna({
+        "precipitation_probability_percent": 0,
+        "uv_index": 0,
+        "aqi": 1,
+        "pm25": 0,
+        "pm10": 0
+    })
+
+    df["temperature_score"] = df["temperature_2m_f"].apply(temperature_score)
+    df["humidity_score"] = df["humidity_percent"].apply(humidity_score)
+    df["precipitation_score"] = df["precipitation_probability_percent"].apply(precipitation_score)
+    df["wind_score"] = df["wind_speed_mph"].apply(wind_score)
+    df["aqi_score"] = df["aqi"].apply(aqi_score)
+    df["uv_score"] = df["uv_index"].apply(uv_score)
+
+    df["run_score"] = (
+        (df["temperature_score"] * 0.30) +
+        (df["humidity_score"] * 0.25) +
+        (df["precipitation_score"] * 0.20) +
+        (df["wind_score"] * 0.10) +
+        (df["aqi_score"] * 0.10) +
+        (df["uv_score"] * 0.05)
+    )
+
+    def recommendation(score):
+        if score >= 90:
+            return "Perfect Conditions for Outside"
+        elif score >= 50:
+            return "Outside Recommended"
+        elif score >= 30:
+            return "Short Outdoor Activity Only"
+        else:
+            return "Indoor Workout Recommended"
+
+    df["recommendation"] = df["run_score"].apply(recommendation)
+
+    final_columns = [
+        "time",
+        "temperature_2m_f",
+        "humidity_percent",
+        "apparent_temperature_f",
+        "precipitation_probability_percent",
+        "wind_speed_mph",
+        "uv_index",
+        "aqi",
+        "pm25",
+        "pm10",
+        "temperature_score",
+        "humidity_score",
+        "precipitation_score",
+        "wind_score",
+        "aqi_score",
+        "uv_score",
+        "run_score",
+        "recommendation"
+    ]
+
+    return df[final_columns]
+
+
+# =========================================================
+# LOAD DATA WITH INCREMENTAL UPSERT
+# =========================================================
+
+def load_to_postgres(df):
+    logger.info("Loading transformed data into PostgreSQL using upsert logic.")
+
+    records = df.to_dict(orient="records")
+
+    upsert_sql = text("""
+        INSERT INTO weather_hourly (
+            time,
+            temperature_2m_f,
+            humidity_percent,
+            apparent_temperature_f,
+            precipitation_probability_percent,
+            wind_speed_mph,
+            uv_index,
+            aqi,
+            pm25,
+            pm10,
+            temperature_score,
+            humidity_score,
+            precipitation_score,
+            wind_score,
+            aqi_score,
+            uv_score,
+            run_score,
+            recommendation
+        )
+        VALUES (
+            :time,
+            :temperature_2m_f,
+            :humidity_percent,
+            :apparent_temperature_f,
+            :precipitation_probability_percent,
+            :wind_speed_mph,
+            :uv_index,
+            :aqi,
+            :pm25,
+            :pm10,
+            :temperature_score,
+            :humidity_score,
+            :precipitation_score,
+            :wind_score,
+            :aqi_score,
+            :uv_score,
+            :run_score,
+            :recommendation
+        )
+        ON CONFLICT (time)
+        DO UPDATE SET
+            temperature_2m_f = EXCLUDED.temperature_2m_f,
+            humidity_percent = EXCLUDED.humidity_percent,
+            apparent_temperature_f = EXCLUDED.apparent_temperature_f,
+            precipitation_probability_percent = EXCLUDED.precipitation_probability_percent,
+            wind_speed_mph = EXCLUDED.wind_speed_mph,
+            uv_index = EXCLUDED.uv_index,
+            aqi = EXCLUDED.aqi,
+            pm25 = EXCLUDED.pm25,
+            pm10 = EXCLUDED.pm10,
+            temperature_score = EXCLUDED.temperature_score,
+            humidity_score = EXCLUDED.humidity_score,
+            precipitation_score = EXCLUDED.precipitation_score,
+            wind_score = EXCLUDED.wind_score,
+            aqi_score = EXCLUDED.aqi_score,
+            uv_score = EXCLUDED.uv_score,
+            run_score = EXCLUDED.run_score,
+            recommendation = EXCLUDED.recommendation;
+    """)
+
+    with engine.begin() as conn:
+        conn.execute(upsert_sql, records)
+
+    logger.info(f"Loaded or updated {len(records)} records.")
+
+
+# =========================================================
+# OPTIONAL ANALYTICS QUERY
+# =========================================================
+
+def show_best_run_times(limit=5):
+    logger.info("Showing best run times based on run_score.")
+
+    with engine.begin() as conn:
+        results = conn.execute(text("""
+            SELECT
+                time,
+                run_score,
+                recommendation,
+                temperature_2m_f,
+                humidity_percent,
+                precipitation_probability_percent,
+                wind_speed_mph,
+                aqi,
+                uv_index
+            FROM weather_hourly
+            ORDER BY run_score DESC, time ASC
+            LIMIT :limit;
+        """), {"limit": limit}).fetchall()
+
+    print("\nBest Run Times:")
+    for row in results:
+        print(row)
+
+
+# =========================================================
+# MAIN ETL PIPELINE
+# =========================================================
+
+def main():
+    try:
+        logger.info("Starting ETL pipeline.")
+
+        if not OPENWEATHER_API_KEY:
+            raise ValueError("Missing OPENWEATHER_API_KEY environment variable.")
+
+        if not SUPABASE_DB_URL:
+            raise ValueError("Missing SUPABASE_DB_URL environment variable.")
+
+        latitude, longitude = get_user_coordinates()
+
+        create_table()
+
+        weather_df = extract_weather_data(latitude, longitude)
+        validate_dataframe(weather_df, "Weather DataFrame")
+
+        air_df = extract_air_quality_data(latitude, longitude)
+        validate_dataframe(air_df, "Air Quality DataFrame")
+
+        final_df = transform_data(weather_df, air_df)
+
+        validate_schema(final_df)
+        validate_ranges(final_df)
+        validate_dataframe(final_df, "Final Transformed DataFrame")
+
+        load_to_postgres(final_df)
+
+        validate_postgres_load(len(final_df))
+
+        show_best_run_times(limit=5)
+
+        logger.info("ETL pipeline completed successfully.")
+
+    except Exception as error:
+        logger.error(f"ETL pipeline failed: {error}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
